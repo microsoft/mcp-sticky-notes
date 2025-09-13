@@ -1,0 +1,7 @@
+{
+  "servers": {
+    "mcp-sticky-notes": {
+      "url": "https://mcp-sticky-notes-hffph3aabtdhfmg7.westus-01.azurewebsites.net/mcp"
+    }
+  }
+}
