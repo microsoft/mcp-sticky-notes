@@ -51,33 +51,26 @@ npm install
 
 npm run build
 
-## Configuration (environment variables)
+## Run on localhost
 
-- TRANSPORT_TYPE: `http` (default) or `stdio`
-- AZURE_STORAGE_ACCOUNT: Azure Storage account name (required for Azure Table Storage)
-- AZURE_STORAGE_KEY: Account key (optional — used as fallback)
-- NOTES_TABLE_NAME: (optional) custom table name (default: `StickyNotesData` in code)
-- PORT: HTTP port (default: `3000`)
-- HOST: bind host (default: `0.0.0.0`)
-- MCP_USER_ID: persistent user id to pin notes to a stable user space
-- LOG_LEVEL: default server log level (`info`)
+Run the MCP server manually.
+`npx ts-node server.ts`
+Server will respond on localhost:3000
 
-Behavior:
-- The server will attempt to authenticate to Azure using Managed Identity (DefaultAzureCredential). If that fails and `AZURE_STORAGE_KEY` exists, it will try storage key auth. If both fail, the server uses an in-memory store.
+in mcp.json, set
+{
+  "servers": {
+    "mcp-sticky-notes": {
+      "url": "http://localhost:3000/mcp?userId=demo_user"
+    }
+  }
+}
 
-## Running the server
+## Debug with MCP inspector
 
-Start in development mode (hot reload using ts-node watch):
-
-npm run dev
-
-Start normally:
-
-npm start
-
-To run in STDIO transport mode (suitable for embedding inside an MCP-aware host), set:
-
-$env:TRANSPORT_TYPE = 'stdio'; npm start   # PowerShell example
+Run MCP inspector
+`npx @modelcontextprotocol/inspector`
+Set command = "http://localhost:3000/mcp?userId=demo_user"
 
 ## HTTP endpoints (MCP transport)
 
@@ -88,60 +81,6 @@ The server uses the MCP JSON-RPC endpoints on `/mcp`.
 - DELETE /mcp — terminate a session (requires `mcp-session-id` header)
 
 Note: For standard MCP usage the client should first send an MCP initialization request. The server will create a session transport for the client and return a generated `mcp-session-id` header which must be used for subsequent requests and SSE connections.
-
-### Quick examples
-
-Set log level (direct handler; does not require session initialization):
-
-curl -X POST http://localhost:3000/mcp -H "Content-Type: application/json" -d \
-'{"jsonrpc":"2.0","id":1,"method":"logging/setLevel","params":{"level":"debug"}}'
-
-Add a note (MCP method `addNote` — requires an initialized MCP session):
-
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "addNote",
-  "params": { "text": "Buy milk \nand eggs", "key": "personal" }
-}
-
-Get a note (most-recent for a key):
-
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "getNote",
-  "params": { "key": "personal" }
-}
-
-List all notes (returns textual summary and a board PNG when possible):
-
-{
-  "jsonrpc": "2.0",
-  "id": 4,
-  "method": "listNotes",
-  "params": {}
-}
-
-Remove a note (logical key):
-
-{
-  "jsonrpc": "2.0",
-  "id": 5,
-  "method": "removeNote",
-  "params": { "key": "personal" }
-}
-
-Clear all notes:
-
-{
-  "jsonrpc": "2.0",
-  "id": 6,
-  "method": "clearNotes",
-  "params": {}
-}
-
-Important: For calls other than `logging/setLevel` and `logging/getLevel`, the HTTP transport expects a prior initialize request so it can create and store a session-backed transport. Use a compliant MCP client (or an `initialize` JSON-RPC request) and capture the `mcp-session-id` header returned by the server. Use that header value on subsequent POST/GET/DELETE requests in the `mcp-session-id` header.
 
 ## Storage and persistence
 
@@ -154,16 +93,6 @@ Important: For calls other than `logging/setLevel` and `logging/getLevel`, the H
 The server attempts to render each note as a PNG using `node-canvas`. If rendering fails (common on platforms that lack native dependencies), the server falls back to text-only responses. The list board view will try to render a combined image of all notes when possible.
 
 If you rely on image output in production, ensure the runtime environment has the native libraries required for `canvas` and `sharp`.
-
-## Troubleshooting
-
-- If images do not render and `canvas` reports errors, install the native dependencies (Cairo, Pango, libjpeg, etc.) for your OS.
-- If Azure authentication fails, ensure Managed Identity is available or set `AZURE_STORAGE_KEY` for fallback.
-- The server prints helpful debug logs to stdout/stderr — use `LOG_LEVEL=debug` to increase verbosity.
-
-## Contributing
-
-Contributions are welcome. Please open issues or PRs to improve functionality, add tests, or improve cross-platform image generation.
 
 ## License
 
