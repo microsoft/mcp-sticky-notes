@@ -53,22 +53,23 @@ npm run build
 
 ## Run on localhost
 
-Run the MCP server manually.
+Run the MCP server manually:
 `npx ts-node server.ts`
 Server will respond on localhost:3000
 
 in mcp.json, set
-{
+```{
   "servers": {
     "mcp-sticky-notes": {
       "url": "http://localhost:3000/mcp?userId=demo_user"
     }
   }
 }
+```
 
 ## Debug with MCP inspector
 
-Run MCP inspector
+Run MCP inspector:
 `npx @modelcontextprotocol/inspector`
 Set command = "http://localhost:3000/mcp?userId=demo_user"
 
