@@ -6,15 +6,38 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolResult, isInitializeRequest, PrimitiveSchemaDefinition, ReadResourceResult, ResourceLink } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { TableClient, AzureNamedKeyCredential, odata } from '@azure/data-tables';
+import { DefaultAzureCredential } from '@azure/identity';
 import { createCanvas } from 'canvas';
 
 // Configuration for transport type
 type TransportType = 'http' | 'stdio';
 const TRANSPORT_TYPE: TransportType = (process.env.TRANSPORT_TYPE as TransportType) || 'http';
 
+// When running in stdio mode, ensure any regular logging does not write to stdout
+// (stdout is reserved for MCP protocol messages). Redirect console.log/info to
+// stderr so human logs appear on stderr and the MCP JSON stream on stdout stays clean.
+if (TRANSPORT_TYPE === 'stdio') {
+  const originalLog = console.log;
+  console.log = (...args: any[]) => {
+    try {
+      console.error(...args);
+    } catch (e) {
+      // Fallback to original if something goes wrong
+      originalLog(...args);
+    }
+  };
+  console.info = (...args: any[]) => {
+    try {
+      console.error(...args);
+    } catch (e) {
+      originalLog(...args);
+    }
+  };
+}
+
 // Azure Table Storage configuration
 const AZURE_STORAGE_ACCOUNT = process.env.AZURE_STORAGE_ACCOUNT || 'defaultstorageaccount';
-const AZURE_STORAGE_KEY = process.env.AZURE_STORAGE_KEY || '';
+const AZURE_STORAGE_KEY = process.env.AZURE_STORAGE_KEY || ''; // Keep as backup fallback
 const NOTES_TABLE_NAME = 'StickyNotesData';
 const DEFAULT_NOTE_KEY = 'default';
 
@@ -27,33 +50,54 @@ const initializeAzureStorage = async (): Promise<TableClient | null> => {
   }
 
   try {
-    if (AZURE_STORAGE_KEY) {
-      // Production mode with actual Azure Storage
-      const credential = new AzureNamedKeyCredential(AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY);
-      tableClient = new TableClient(`https://${AZURE_STORAGE_ACCOUNT}.table.core.windows.net`, NOTES_TABLE_NAME, credential);
-    } else {
-      throw new Error('Azure Storage key is required');
-    }
+    // Try Managed Identity first (preferred method)
+    console.log('🔐 Attempting authentication with Managed Identity...');
+    const credential = new DefaultAzureCredential();
+    tableClient = new TableClient(`https://${AZURE_STORAGE_ACCOUNT}.table.core.windows.net`, NOTES_TABLE_NAME, credential);
 
-    // Create table if it doesn't exist
+    // Test the connection by trying to create table
     await tableClient.createTable();
+    console.log('✅ Successfully authenticated with Managed Identity');
     return tableClient;
-  } catch (error) {
-    // Fallback to in-memory storage if Azure is not available
+  } catch (managedIdentityError) {
+    console.log('⚠️ Managed Identity authentication failed, trying storage key fallback...');
+    console.log('Managed Identity error:', managedIdentityError instanceof Error ? managedIdentityError.message : String(managedIdentityError));
+    
+    // Fallback to storage key authentication
+    if (AZURE_STORAGE_KEY) {
+      try {
+        console.log('🔑 Attempting authentication with Storage Key...');
+        const keyCredential = new AzureNamedKeyCredential(AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY);
+        tableClient = new TableClient(`https://${AZURE_STORAGE_ACCOUNT}.table.core.windows.net`, NOTES_TABLE_NAME, keyCredential);
+        
+        // Test the connection
+        await tableClient.createTable();
+        console.log('✅ Successfully authenticated with Storage Key (fallback)');
+        return tableClient;
+      } catch (keyError) {
+        console.log('❌ Storage Key authentication also failed');
+        console.log('Storage Key error:', keyError instanceof Error ? keyError.message : String(keyError));
+      }
+    } else {
+      console.log('🔑 No storage key available for fallback');
+    }
+    
+    // Fallback to in-memory storage if both Azure methods fail
     console.log('📝 Azure Table Storage not available, using in-memory storage');
     return null;
   }
 };
 
-// In-memory fallback storage - now organized by user partition
-const memoryNotes: { [partitionKey: string]: { [key: string]: { text: string; timestamp: Date; } } } = {};
-
+// In-memory fallback storage - now organized by user partition and logical key; each key holds an array of notes
+const memoryNotes: { [partitionKey: string]: { [noteKey: string]: Array<{ id: string; text: string; timestamp: Date; }> } } = {};
+ 
 // Sticky note storage interface
 interface StickyNoteEntity {
   partitionKey: string;
-  rowKey: string;
-  text: string;
-  timestamp: Date | string; // Azure might return string timestamps
+  rowKey: string; // unique id for this particular note entity
+  noteKey?: string; // logical grouping key (e.g. "default", "private")
+  text: string; // the note text
+  timestamp: Date | string; // created at
   etag?: string;
 }
 
@@ -278,6 +322,39 @@ const createFormattedStickyNoteText = (key: string, text: string, timestamp: Dat
   return `${color} "${key}"\n  "${text}"\n  (created ${timeAgo})`;
 };
 
+// New: format a single note item without repeating the key (used when group header already shows the key)
+const createFormattedStickyNoteItemText = (key: string, text: string, timestamp: Date): string => {
+  const color = getNoteColor(key);
+  const timeAgo = formatTimeAgo(timestamp);
+
+  // Show color and the note text, but omit the repeated key
+  return `${color} "${text}"\n  (created ${timeAgo})`;
+};
+
+// Helper to log MCP responses consistently (added for better debugging)
+const logMcpResponse = (content: any[]) => {
+  console.log('📋 MCP response:');
+  try {
+    const textParts = (content || [])
+      .filter((c: any) => c && c.type === 'text')
+      .map((c: any) => c.text)
+      .join('\n\n');
+    if (textParts) console.log(textParts);
+
+    for (const c of content || []) {
+      if (c && c.type === 'image') {
+        try {
+          console.log(`🖼️ Image: ${c.mimeType}, data length=${String((c.data || '').length)}`);
+        } catch (e) {
+          console.log('🖼️ Image: (unable to compute data length)');
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Failed to log MCP response:', err);
+  }
+};
+
 // Format timestamp relative to now
 const formatTimeAgo = (timestamp: Date): string => {
   try {
@@ -318,18 +395,31 @@ const getUserPartitionKey = (userId?: string): string => {
   return 'user-anonymous';
 };
 
+// Helper to save a note to the in-memory fallback (centralized to avoid duplication)
+const saveNoteInMemory = (partitionKey: string, key: string, text: string, timestamp: Date) => {
+  if (!memoryNotes[partitionKey]) {
+    memoryNotes[partitionKey] = {};
+  }
+  if (!memoryNotes[partitionKey][key]) {
+    memoryNotes[partitionKey][key] = [];
+  }
+  memoryNotes[partitionKey][key].push({ id: randomUUID(), text, timestamp });
+};
+
 const stickNote = async (key: string, text: string): Promise<void> => {
   const timestamp = new Date();
   const userId = getOrCreateUserId();
   const partitionKey = getUserPartitionKey(userId);
-  
+
   try {
     const client = await initializeAzureStorage();
     if (client) {
+      // Store each note as its own entity with a unique rowKey and a noteKey for grouping
       console.log(`📝 Sticking note in Azure Table Storage for user ${partitionKey}, key: ${key}`);
       const entity: StickyNoteEntity = {
         partitionKey: partitionKey,
-        rowKey: key,
+        rowKey: randomUUID(),
+        noteKey: key,
         text: text,
         timestamp: timestamp
       };
@@ -337,111 +427,110 @@ const stickNote = async (key: string, text: string): Promise<void> => {
     } else {
       // Fallback to memory storage
       console.log(`📝 Sticking note in memory storage for user ${partitionKey}, key: ${key}`);
-      if (!memoryNotes[partitionKey]) {
-        memoryNotes[partitionKey] = {};
-      }
-      memoryNotes[partitionKey][key] = { text, timestamp };
+      saveNoteInMemory(partitionKey, key, text, timestamp);
     }
   } catch (error) {
     // Fallback to memory storage on error
     console.log(`📝 Azure storage failed, using memory storage for user ${partitionKey}, key: ${key}`);
-    if (!memoryNotes[partitionKey]) {
-      memoryNotes[partitionKey] = {};
-    }
-    memoryNotes[partitionKey][key] = { text, timestamp };
+    saveNoteInMemory(partitionKey, key, text, timestamp);
   }
 };
 
-const peelNote = async (key: string): Promise<{ text: string; timestamp: Date; } | null> => {
-  const userId = getOrCreateUserId();
-  const partitionKey = getUserPartitionKey(userId);
-  
-  try {
-    const client = await initializeAzureStorage();
-    if (client) {
-      console.log(`📝 Peeling note from Azure Table Storage for user ${partitionKey}, key: ${key}`);
-      const entity = await client.getEntity<StickyNoteEntity>(partitionKey, key);
-      // Ensure timestamp is a proper Date object - Azure Table Storage might return it as string
-      let timestamp: Date;
-      if (typeof entity.timestamp === 'string') {
-        timestamp = new Date(entity.timestamp);
-      } else {
-        // Assume it's already a Date or convert it
-        timestamp = new Date(entity.timestamp as any);
-      }
-      
-      // Validate the date
-      if (isNaN(timestamp.getTime())) {
-        timestamp = new Date();
-      }
-      
-      return { text: entity.text, timestamp };
-    } else {
-      // Fallback to memory storage
-      console.log(`📝 Peeling note from memory storage for user ${partitionKey}, key: ${key}`);
-      const userNotes = memoryNotes[partitionKey];
-      const note = userNotes?.[key] || null;
-      
-      // Ensure memory storage note also has valid timestamp
-      if (note && (!note.timestamp || isNaN(note.timestamp.getTime()))) {
-        note.timestamp = new Date();
-      }
-      
-      return note;
-    }
-  } catch (error) {
-    // Try memory storage as fallback
-    console.log(`📝 Azure retrieval failed, using memory storage for user ${partitionKey}, key: ${key}`);
-    const userNotes = memoryNotes[partitionKey];
-    const note = userNotes?.[key] || null;
-    
-    // Ensure memory storage note also has valid timestamp
-    if (note && (!note.timestamp || isNaN(note.timestamp.getTime()))) {
-      note.timestamp = new Date();
-    }
-    
-    return note;
-  }
+// Helper to read the most recent note from the in-memory fallback
+const getLatestNoteFromMemory = (partitionKey: string, key: string): { text: string; timestamp: Date; id?: string } | null => {
+  const userNotes = memoryNotes[partitionKey]?.[key] || [];
+  if (userNotes.length === 0) return null;
+  // Create a shallow copy and sort by timestamp descending
+  const sorted = (userNotes || []).slice().sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  const note = sorted[0];
+  return { text: note.text, timestamp: note.timestamp, id: note.id };
 };
 
-const listNoteKeys = async (): Promise<string[]> => {
+const peelNote = async (key: string): Promise<{ text: string; timestamp: Date; id?: string } | null> => {
   const userId = getOrCreateUserId();
   const partitionKey = getUserPartitionKey(userId);
-  
   try {
     const client = await initializeAzureStorage();
     if (client) {
+      // Find entities with noteKey == key (or legacy rowKey == key)
       const entities = client.listEntities<StickyNoteEntity>({
-        queryOptions: { filter: odata`PartitionKey eq '${partitionKey}'` }
+        queryOptions: { filter: odata`PartitionKey eq '${partitionKey}' and (noteKey eq '${key}' or rowKey eq '${key}')` }
       });
-      const keys: string[] = [];
+      let latest: StickyNoteEntity | null = null;
       for await (const entity of entities) {
-        keys.push(entity.rowKey);
+        if (!latest) { latest = entity; continue; }
+        const latestTs = new Date(latest.timestamp as any);
+        const thisTs = new Date(entity.timestamp as any);
+        if (isNaN(latestTs.getTime()) || thisTs.getTime() > latestTs.getTime()) latest = entity;
       }
-      return keys.sort();
+      if (!latest) return null;
+      const ts = typeof latest.timestamp === 'string' ? new Date(latest.timestamp) : new Date(latest.timestamp as any);
+      return { text: latest.text, timestamp: isNaN(ts.getTime()) ? new Date() : ts, id: latest.rowKey };
     } else {
-      // Fallback to memory storage
-      const userNotes = memoryNotes[partitionKey];
-      return userNotes ? Object.keys(userNotes).sort() : [];
+      const memoryNote = getLatestNoteFromMemory(partitionKey, key);
+      return memoryNote;
     }
   } catch (error) {
-    // Fallback to memory storage on error
-    const userNotes = memoryNotes[partitionKey];
-    return userNotes ? Object.keys(userNotes).sort() : [];
+    const memoryNote = getLatestNoteFromMemory(partitionKey, key);
+    return memoryNote;
   }
+};
+
+
+// Helper to build grouped notes response from the in-memory fallback (avoids duplicated code)
+const getGroupedFromMemory = (partitionKey: string): Array<{ key: string; items: Array<{ id: string; text: string; timestamp: Date }> }> => {
+  const userNotes = memoryNotes[partitionKey] || {};
+  return Object.keys(userNotes).sort().map(k => ({
+    key: k,
+    items: (userNotes[k] || []).slice().sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+  }));
+};
+
+// Return grouped notes data for the current user (one entity per logical key, with items array)
+const listNotesData = async (): Promise<Array<{ key: string; items: Array<{ id: string; text: string; timestamp: Date }> }>> => {
+  const userId = getOrCreateUserId();
+  const partitionKey = getUserPartitionKey(userId);
+  try {
+    const client = await initializeAzureStorage();
+    if (client) {
+      const entities = client.listEntities<StickyNoteEntity>({ queryOptions: { filter: odata`PartitionKey eq '${partitionKey}'` } });
+      const groups: { [k: string]: Array<{ id: string; text: string; timestamp: Date }> } = {};
+      for await (const entity of entities) {
+        const noteKey = entity.noteKey || entity.rowKey;
+        if (!groups[noteKey]) groups[noteKey] = [];
+        const ts = typeof entity.timestamp === 'string' ? new Date(entity.timestamp) : new Date(entity.timestamp as any);
+        groups[noteKey].push({ id: entity.rowKey, text: entity.text, timestamp: isNaN(ts.getTime()) ? new Date() : ts });
+      }
+      return Object.keys(groups).sort().map(k => ({ key: k, items: groups[k].sort((a,b) => b.timestamp.getTime() - a.timestamp.getTime()) }));
+    } else {
+      return getGroupedFromMemory(partitionKey);
+    }
+  } catch (error) {
+    return getGroupedFromMemory(partitionKey);
+  }
+};
+
+// Get note keys for the current user (unique logical keys)
+const listNoteKeys = async (): Promise<string[]> => {
+  const groups = await listNotesData();
+  return groups.map(g => g.key).sort();
 };
 
 const removeNote = async (key: string): Promise<boolean> => {
   const userId = getOrCreateUserId();
   const partitionKey = getUserPartitionKey(userId);
-  
   try {
     const client = await initializeAzureStorage();
     if (client) {
-      await client.deleteEntity(partitionKey, key);
-      return true;
+      // Find all entities matching this logical key and delete each one
+      const entities = client.listEntities<StickyNoteEntity>({ queryOptions: { filter: odata`PartitionKey eq '${partitionKey}' and (noteKey eq '${key}' or rowKey eq '${key}')` } });
+      let found = false;
+      for await (const entity of entities) {
+        found = true;
+        try { await client.deleteEntity(partitionKey, entity.rowKey); } catch (err) { console.error('Error deleting entity', err); }
+      }
+      return found;
     } else {
-      // Fallback to memory storage
       const userNotes = memoryNotes[partitionKey];
       if (userNotes && userNotes[key]) {
         delete userNotes[key];
@@ -450,7 +539,6 @@ const removeNote = async (key: string): Promise<boolean> => {
       return false;
     }
   } catch (error) {
-    // Try memory storage as fallback
     const userNotes = memoryNotes[partitionKey];
     if (userNotes && userNotes[key]) {
       delete userNotes[key];
@@ -564,8 +652,6 @@ const generateNotesBoard = async (notes: Array<{key: string, text: string, times
       ctx.font = '11px "Liberation Sans", "DejaVu Sans", Arial, sans-serif';
       
       const lineHeight = 18; // Line height for 11px font
-      const textStartY = y + 45; // Where text starts (after header and separator)
-      const textEndY = y + noteHeight - 25; // Leave space for timestamp
       const maxLines = calculateMaxLines(noteHeight, 45, noteHeight - 25, lineHeight);
       
       const lines = splitTextIntoLines(note.text, ctx, maxWidth, maxLines);
@@ -654,7 +740,7 @@ const getServer = () => {
   const server = new McpServer({
     name: 'azure-sticky-notes-server',
     version: '1.0.0'
-  }, { capabilities: { logging: {} } });
+  });
 
   // Register sticky note tools
   
@@ -674,7 +760,6 @@ const getServer = () => {
         const noteKey = key || DEFAULT_NOTE_KEY;
         await stickNote(noteKey, text);
         
-        const color = getNoteColor(noteKey);
         const timestamp = new Date();
         const formattedNote = createFormattedStickyNoteText(noteKey, text, timestamp);
         
@@ -692,7 +777,7 @@ const getServer = () => {
               data: imageBase64,
               mimeType: 'image/png'
             };
-            console.log(`📋 Image content created:`, JSON.stringify(imageContent, null, 2));
+            //console.log(`📋 Image content created:`, JSON.stringify(imageContent, null, 2));
           } else {
             console.log(`❌ Image base64 data is empty, skipping image content`);
           }
@@ -701,6 +786,7 @@ const getServer = () => {
           // Continue without image
         }
         
+        // Build response content (text summary + optional image)
         const content: any[] = [
           {
             type: 'text',
@@ -715,15 +801,15 @@ const getServer = () => {
             ].join('\n'),
           }
         ];
-        
-        // Add image if generation was successful
         if (imageContent) {
           content.push(imageContent);
         }
-        
+
+        // Log the MCP response consistently
+        logMcpResponse(content);
         return { content };
       } catch (error) {
-        return {
+        const errorContent: CallToolResult = {
           content: [
             {
               type: 'text',
@@ -731,6 +817,8 @@ const getServer = () => {
             },
           ],
         };
+        logMcpResponse(errorContent.content);
+        return errorContent;
       }
     }
   );
@@ -751,30 +839,30 @@ const getServer = () => {
         
         if (success) {
           const color = getNoteColor(key);
-          return {
+          const resp: CallToolResult = {
             content: [
               {
                 type: 'text',
-                text: `🗑️ Note Removed!
-
-${color} "${key}" has been peeled off your board
-👤 ${getUserPartitionKey(getOrCreateUserId())}`,
+                text: `🗑️ Note Removed!\n\n${color} "${key}" has been peeled off your board\n👤 ${getUserPartitionKey(getOrCreateUserId())}`,
               },
             ],
           };
+          logMcpResponse(resp.content);
+          return resp;
         } else {
-          return {
+          const resp: CallToolResult = {
             content: [
               {
                 type: 'text',
-                text: `📝 No sticky note found with name: "${key}"
-👤 ${getUserPartitionKey(getOrCreateUserId())}`,
+                text: `📝 No sticky note found with name: "${key}"\n👤 ${getUserPartitionKey(getOrCreateUserId())}`,
               },
             ],
           };
+          logMcpResponse(resp.content);
+          return resp;
         }
       } catch (error) {
-        return {
+        const errorContent: CallToolResult = {
           content: [
             {
               type: 'text',
@@ -782,6 +870,8 @@ ${color} "${key}" has been peeled off your board
             },
           ],
         };
+        logMcpResponse(errorContent.content);
+        return errorContent;
       }
     }
   );
@@ -799,58 +889,36 @@ ${color} "${key}" has been peeled off your board
     async ({ key }): Promise<CallToolResult> => {
       try {
         const noteKey = key || DEFAULT_NOTE_KEY;
-        const result = await peelNote(noteKey);
-        
-        if (!result) {
-          return {
-            content: [
-              {
-                type: 'text',
-                text: `📝 No sticky note found with name: "${noteKey}"\n👤 ${getUserPartitionKey(getOrCreateUserId())}`,
-              },
-            ],
-          };
+        const grouped = await listNotesData();
+        const group = grouped.find(g => g.key === noteKey);
+        if (!group || group.items.length === 0) {
+          return { content: [ { type: 'text', text: `📝 No sticky note found with name: "${noteKey}"\n👤 ${getUserPartitionKey(getOrCreateUserId())}` } ] };
         }
-        
-        const formattedNote = createFormattedStickyNoteText(noteKey, result.text, result.timestamp || new Date());
-        
-        // Try to generate image, but fall back to text-only if it fails
+
+        const parts: string[] = ['📌 Here are the sticky note(s):', ''];
+        for (const item of group.items) {
+          parts.push(createFormattedStickyNoteItemText(group.key, item.text, item.timestamp));
+        }
+        parts.push('', `👤 ${getUserPartitionKey(getOrCreateUserId())}`);
+
+        // Attach image for the most recent item if available
         let imageContent: any = null;
         try {
-          const imageBase64 = await generateStickyNoteImage(noteKey, result.text, result.timestamp || new Date());
-          if (imageBase64) {
-            imageContent = {
-              type: 'image',
-              data: imageBase64,
-              mimeType: 'image/png'
-            };
-          }
+          const latest = group.items[0];
+          const imageBase64 = await generateStickyNoteImage(group.key, latest.text, latest.timestamp);
+          if (imageBase64) imageContent = { type: 'image', data: imageBase64, mimeType: 'image/png' };
         } catch (imageError) {
-          console.error('Image generation failed:', imageError);
-          // Continue without image
+          console.error('Image generation failed for getNote:', imageError);
         }
-        
-        const content: any[] = [
-          {
-            type: 'text',
-            text: [
-              '📌 Here is your sticky note:',
-              '',
-              formattedNote,
-              '',
-              `👤 ${getUserPartitionKey(getOrCreateUserId())}`
-            ].join('\n'),
-          }
-        ];
-        
-        // Add image if generation was successful
-        if (imageContent) {
-          content.push(imageContent);
-        }
-        
+
+        const content: any[] = [ { type: 'text', text: parts.join('\n') } ];
+        if (imageContent) content.push(imageContent);
+
+        // Log MCP response
+        logMcpResponse(content);
         return { content };
       } catch (error) {
-        return {
+        const errorContent: CallToolResult = {
           content: [
             {
               type: 'text',
@@ -858,6 +926,8 @@ ${color} "${key}" has been peeled off your board
             },
           ],
         };
+        logMcpResponse(errorContent.content);
+        return errorContent;
       }
     }
   );
@@ -872,9 +942,10 @@ ${color} "${key}" has been peeled off your board
     },
     async (): Promise<CallToolResult> => {
       try {
-        const keys = await listNoteKeys();
-        
-        if (keys.length === 0) {
+       
+        // Fetch grouped notes once to avoid duplicate storage calls
+        const grouped = await listNotesData();
+        if (grouped.length === 0) {
           return {
             content: [
               {
@@ -891,32 +962,41 @@ ${color} "${key}" has been peeled off your board
             ],
           };
         }
-        
-        // Collect all notes data for board generation
-        const notesData = [];
-        for (const key of keys) {
-          try {
-            const data = await peelNote(key);
-            if (data) {
-              notesData.push({
-                key,
-                text: data.text,
-                timestamp: data.timestamp || new Date()
-              });
-            }
-          } catch (error) {
-            console.error(`Error retrieving note ${key}:`, error);
+
+        const notesData: Array<{ key: string; text: string; timestamp: Date }> = [];
+        for (const group of grouped) {
+          for (const item of group.items) {
+            notesData.push({ key: group.key, text: item.text, timestamp: item.timestamp });
           }
         }
-        
-        // Generate text representation
-        let textResponse = `🗂️ Your Sticky Notes Board • 👤 ${getUserPartitionKey(getOrCreateUserId())}\n\nYou have ${notesData.length} sticky note${notesData.length !== 1 ? 's' : ''}:\n\n`;
-        
-        for (const note of notesData) {
-          const formattedNote = createFormattedStickyNoteText(note.key, note.text, note.timestamp);
-          textResponse += formattedNote + '\n';
+
+        // Log all keys and their text for debugging purposes (show key, text and timestamp)
+        try {
+          const partition = getUserPartitionKey(getOrCreateUserId());
+          console.log(`🗂️ Listing notes for ${partition} - keys: ${grouped.length}, items: ${notesData.length}`);
+          for (const group of grouped) {
+            console.log(` - ${group.key} (${group.items.length} item${group.items.length !== 1 ? 's' : ''}):`);
+            for (const item of group.items) {
+              const singleLineText = typeof item.text === 'string' ? item.text.replace(/\r?\n/g, ' ↵ ') : String(item.text);
+              console.log(`     • ${singleLineText} (${formatTimeAgo(item.timestamp)})`);
+            }
+          }
+        } catch (logError) {
+          console.error('Failed to log grouped notes for listNotes:', logError);
         }
-        
+
+        // Generate text representation grouped by key
+        let textResponse = `🗂️ Your Sticky Notes Board • 👤 ${getUserPartitionKey(getOrCreateUserId())}\n\nYou have ${notesData.length} sticky note${notesData.length !== 1 ? 's' : ''} across ${grouped.length} key${grouped.length !== 1 ? 's' : ''}:\n\n`;
+        for (const group of grouped) {
+          textResponse += `${getNoteColor(group.key)} "${group.key}" (${group.items.length} item${group.items.length !== 1 ? 's' : ''}):\n`;
+          for (const item of group.items) {
+            const formattedNote = createFormattedStickyNoteItemText(group.key, item.text, item.timestamp);
+            const indented = formattedNote.split('\n').map((l, i) => i === 0 ? `  - ${l}` : `    ${l}`).join('\n');
+            textResponse += indented + '\n';
+          }
+          textResponse += '\n';
+        }
+
         // Generate board image with error handling
         let boardImageContent: any = null;
         let boardGenerationError = '';
@@ -960,10 +1040,12 @@ ${color} "${key}" has been peeled off your board
         } else {
           console.log(`❌ No board image to add to response`);
         }
-        
+
+        // Log MCP response
+        logMcpResponse(content);
         return { content };
       } catch (error) {
-        return {
+        const errorContent: CallToolResult = {
           content: [
             {
               type: 'text',
@@ -971,6 +1053,8 @@ ${color} "${key}" has been peeled off your board
             },
           ],
         };
+        logMcpResponse(errorContent.content);
+        return errorContent;
       }
     }
   );
@@ -995,22 +1079,19 @@ ${color} "${key}" has been peeled off your board
           }
         }
         
-        return {
+        const contentResp: CallToolResult = {
           content: [
             {
               type: 'text',
-              text: `🗂️ Board Cleared!
-
-🗑️ Successfully removed all sticky notes from your board
-📊 Deleted ${deletedCount} note${deletedCount !== 1 ? 's' : ''} total
-👤 ${getUserPartitionKey(getOrCreateUserId())}
-
-✨ Fresh start! Ready for new notes.`,
+              text: `🗂️ Board Cleared!\n\n🗑️ Successfully removed all sticky notes from your board\n📊 Deleted ${deletedCount} note${deletedCount !== 1 ? 's' : ''} total\n👤 ${getUserPartitionKey(getOrCreateUserId())}\n\n✨ Fresh start! Ready for new notes.`,
             },
           ],
         };
+
+        logMcpResponse(contentResp.content);
+        return contentResp;
       } catch (error) {
-        return {
+        const errorContent: CallToolResult = {
           content: [
             {
               type: 'text',
@@ -1018,6 +1099,8 @@ ${color} "${key}" has been peeled off your board
             },
           ],
         };
+        logMcpResponse(errorContent.content);
+        return errorContent;
       }
     }
   );
@@ -1051,6 +1134,34 @@ async function startHttpServer() {
   // MCP POST endpoint
   const mcpPostHandler = async (req: Request, res: Response) => {
     console.log('Received MCP request:', req.body);
+
+    // Quick direct handler for the exact method names we need to support immediately
+    try {
+      if (req.body && typeof req.body.method === 'string') {
+        if (req.body.method === 'logging/setLevel') {
+          const requested = String(req.body.params?.level || '').toLowerCase();
+          const valid = ['error','warn','info','debug','trace','off'];
+          if (!requested || !valid.includes(requested)) {
+            res.status(200).json({ jsonrpc: '2.0', id: req.body.id ?? null, error: { code: -32602, message: `Invalid params: level must be one of ${valid.join(', ')}` } });
+            return;
+          }
+          process.env.LOG_LEVEL = requested;
+          console.log(`🔧 Direct handler: Log level set to ${requested}`);
+          res.status(200).json({ jsonrpc: '2.0', id: req.body.id ?? null, result: { content: [ { type: 'text', text: `✅ Log level set to ${requested}` } ] } });
+          return;
+        }
+
+        if (req.body.method === 'logging/getLevel') {
+          const current = (process.env.LOG_LEVEL || 'info').toLowerCase();
+          res.status(200).json({ jsonrpc: '2.0', id: req.body.id ?? null, result: { content: [ { type: 'text', text: `ℹ️ Current log level: ${current}` } ] } });
+          return;
+        }
+      }
+    } catch (err) {
+      console.error('Direct logging handler error:', err);
+      // fall through to normal handling
+    }
+
     try {
       // Extract user ID from request for this session
       const requestUserId = getUserIdFromRequest(req);
@@ -1090,11 +1201,27 @@ async function startHttpServer() {
         };
 
         // Connect the transport to the MCP server BEFORE handling the request
-        // so responses can flow back through the same transport
         const server = getServer(); // Will get session ID from transport after initialization
         await server.connect(transport);
 
-        await transport.handleRequest(req, res, req.body);
+        // Map the initial request if it uses a non-tool-friendly method name
+        const mapMethodIfNeeded_init = (body: any) => {
+          if (!body || typeof body.method !== 'string') return body;
+          // Minimal mapping for the client's exact method names
+          if (body.method === 'logging/setLevel') {
+            const clone = JSON.parse(JSON.stringify(body));
+            clone.method = 'logging-set-level';
+            return clone;
+          }
+          if (body.method === 'logging/getLevel') {
+            const clone = JSON.parse(JSON.stringify(body));
+            clone.method = 'logging-get-level';
+            return clone;
+          }
+          return body;
+        };
+
+        await transport.handleRequest(req, res, mapMethodIfNeeded_init(req.body));
         return; // Already handled
       } else {
         // Invalid request - no session ID or not initialization request
@@ -1111,7 +1238,25 @@ async function startHttpServer() {
 
       // Handle the request with existing transport - no need to reconnect
       // The existing transport is already connected to the server
-      await transport.handleRequest(req, res, req.body);
+
+      // Minimal mapping: only handle the exact methods your client sends
+      const mapMethodIfNeeded = (body: any) => {
+        if (!body || typeof body.method !== 'string') return body;
+        if (body.method === 'logging/setLevel') {
+          const clone = JSON.parse(JSON.stringify(body));
+          clone.method = 'logging-set-level';
+          return clone;
+        }
+        if (body.method === 'logging/getLevel') {
+          const clone = JSON.parse(JSON.stringify(body));
+          clone.method = 'logging-get-level';
+          return clone;
+        }
+        return body;
+      };
+
+      const mappedBody = mapMethodIfNeeded(req.body);
+      await transport.handleRequest(req, res, mappedBody);
     } catch (error) {
       console.error('Error handling MCP request:', error);
       if (!res.headersSent) {
@@ -1215,14 +1360,13 @@ async function startHttpServer() {
 // Main function to start the appropriate server based on configuration
 async function main() {
   // Check storage configuration at startup
+  console.log('🔵 Azure Table Storage configured with hybrid authentication (Production mode)');
+  console.log('🔐 Primary: Managed Identity, Fallback: Storage Key');
+  
   if (AZURE_STORAGE_KEY) {
-    console.log('🔵 Azure Table Storage configured (Production mode)');
-  } else if (process.env.AZURE_STORAGE_CONNECTION_STRING) {
-    console.log('🟡 Azurite local emulator configured (Development mode)');
+    console.log('🔑 Storage Key available as backup authentication method');
   } else {
-    console.log('🟠 No Azure storage configured - using IN-MEMORY storage');
-    console.log('💡 Data will be lost when server restarts');
-    console.log('📝 To use persistent storage, set AZURE_STORAGE_ACCOUNT and AZURE_STORAGE_KEY environment variables');
+    console.log('⚠️ No Storage Key available - Managed Identity only');
   }
 
   if (TRANSPORT_TYPE === 'stdio') {
@@ -1241,10 +1385,6 @@ async function main() {
 
 // Start the server
 main().catch((error) => {
-  if (TRANSPORT_TYPE === 'stdio') {
-    console.error("Sticky Notes server error:", error);
-  } else {
-    console.error("Sticky Notes server error:", error);
-  }
+  console.error("Sticky Notes server error:", error);
   process.exit(1);
 });
