@@ -58,7 +58,8 @@ Run the MCP server manually:
 Server will respond on localhost:3000
 
 in mcp.json, set
-```{
+```
+{
   "servers": {
     "mcp-sticky-notes": {
       "url": "http://localhost:3000/mcp?userId=demo_user"
