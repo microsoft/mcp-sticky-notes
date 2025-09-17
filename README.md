@@ -1,4 +1,4 @@
-# MCP Sticky Notes Server (Azure)
+# MCP Sticky Notes
 
 A small MCP (Model Context Protocol) server that manages colorful sticky notes with optional visual PNG renderings. It stores notes in Azure Table Storage (preferred via Managed Identity or an account key fallback) and falls back to in-memory storage when Azure is unavailable. The server exposes MCP tools for adding, removing, listing and clearing notes and supports both HTTP and STDIO transports.
 
