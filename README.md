@@ -3,20 +3,19 @@
 A small MCP (Model Context Protocol) server that manages colorful sticky notes with optional visual PNG renderings. It stores notes in Azure Table Storage (preferred via Managed Identity or an account key fallback) and falls back to in-memory storage when Azure is unavailable. The server exposes MCP tools for adding, removing, listing and clearing notes and supports both HTTP and STDIO transports.
 
 ## Examples
+<img width="2299" height="916" alt="addNote" src="https://github.com/user-attachments/assets/b0b34ebb-3911-4753-95d2-679fc3faa9a2" />
 
-![](doc\addNote.png)
+<img width="2278" height="1282" alt="listNotes" src="https://github.com/user-attachments/assets/8c308cde-db93-4e61-a362-22add2b0fe9e" />
 
-![](doc\listNotes.png)
+<img width="2494" height="1429" alt="mcp-inspector1" src="https://github.com/user-attachments/assets/779c2483-6a20-4520-ba11-8f0685a4f28b" />
 
-![](doc\mcp-inspector1.png)
+<img width="2495" height="1428" alt="mcp-inspector2" src="https://github.com/user-attachments/assets/93c11a4c-7a95-4000-b321-ebb5b7c0c0d4" />
 
-![](doc\mcp-inspector2.png)
+<img width="1218" height="521" alt="chatListNote" src="https://github.com/user-attachments/assets/4e8865e8-f6f5-4d69-9c33-9b5ac565a7e9" />
 
-![](doc\chatAddNote.png)
+<img width="1229" height="564" alt="chatAddNote" src="https://github.com/user-attachments/assets/1c2d534a-3000-4437-bcf0-c2b8a4955412" />
 
-![](doc\chatListNote.png)
-
-![](doc\chatListNotes.png)
+<img width="1228" height="1457" alt="chatListNotes" src="https://github.com/user-attachments/assets/7537e362-35b7-4403-83a4-4bef6aa76e2c" />
 
 
 ## Features
