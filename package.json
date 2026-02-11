@@ -23,7 +23,7 @@
     "@azure/storage-blob": "^12.27.0",
     "@fontsource/inter": "^5.2.6",
     "@modelcontextprotocol/sdk": "^1.13.0",
-    "axios": "^1.11.0",
+    "axios": "^1.13.5",
     "boxen": "^5.1.2",
     "canvas": "^3.1.2",
     "chalk": "^4.1.2",
